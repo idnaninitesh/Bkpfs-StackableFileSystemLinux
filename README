@@ -1,0 +1,224 @@
+Files added:
+	User code:
+		1) bkpctl - To test version file functionality (l/d/v/r)
+		2) create_iter_opclose - To open,close,write in loop and
+		populate backups
+		3) create_iter_write - To write in loop and populate backups
+		4) create_mul_versions - To create multiple version file
+		5) create_no_versions - To create no version file
+		6) create_one_version - To create one version file
+		7) create_write_pagesize - To write page size bytes to file
+		8) kernel.config - Config file to build the kernel
+		9) Makefile - To compile all the c helper codes
+		10) README - Contains info about the code implementation
+		11) test_scripts(FOLDER) - Contains all the test scripts
+		 named test01..38
+	Include file (in include/linux/bkpfs.h):
+		Common header file used by both user and bkpfs kernel code
+	Kernek code (fs/bkpfs):
+		Folder clones from fs/wrapfs and augmented with necessary
+		logic for handling backup of regular files
+
+Note:
+	BKPFS is loaded as a module i.e. (CONFIG_BKP_FS=m) in kernel.config
+	file and an entry has been made in fs/Kconfig (line 19)
+	and fs/Makefile (line 88).
+
+
+Approach and design decisions:
+
+Extended atrributes used in bkpfs:
+	num_bytes: To track total number of bytes modified in file
+		updated during vfs_write
+	min_ver: To store the lowest(oldest) version number for the file
+		updated during unlink(oldest)
+	max_ver: To store the highest(newest) version number for file
+		updated during create and unlink(newest/all)
+
+1) When to backup?
+	- The code for creating backups in included in bkpfs_write and
+	bkpfs_close to allow for backup creation on file write and close.
+	- During file write, if bytes modified (i.e. num_bytes) is more
+	than threshold (1024) bytes, then a backup of the file is created.
+	- I have picked 1024 to align with PAGE_SIZE(4096) and moreover to
+	handle tradeoff between excessive backups and loss of data since 1024
+	is a moderate size for write and user code usually handles write around
+	that size in iterations.
+	- The number of bytes is conditioned to return value from vfs_write
+	for the original file and that value is used to update the
+	xattr(num_bytes) since it will help to store the number of bytes
+	modified in the file and create a backup accordingly.
+	- However, if user writes less than 1024 bytes and closes the file,
+	a backup would not be created. To avoid this and to ensure backup
+	importance, I have added support for backup creation on file close
+	if user has written positive bytes (i.e. num_bytes > 0).
+	- If a backup file is created following changes occur:
+		num_bytes is reset to 0 to indicate file upto this state
+		has been backed up
+		max_ver is incremented by 1 to indicate new backup file
+	- If the backup file with same name already exists, it is overwritten.
+
+2) Where to store backups?
+	- Currently, the backups are stored in the same bkpfs path as the
+	original file.
+	- The backup files have been named as: .FILE_v$num
+		where FILE is the original file name and $num is file's
+		version num.
+	- During creation num increases by 1, during deletion num decreases
+	by 1.
+
+3) Visibility policy
+	- To ensure version file hiding from the normal user in ls and
+	rm command, we add a callback(filldir) in readdir to filter
+	version file names.
+	- We check for following conditions to filter version filenames:
+		1) File name starts with .(PREFIX)
+		2) File name len atleast 4 (PREFIX+SUFFIX)
+		3) Fil name ends with a number
+		4) The end number is preceeded by _v(SUFFIX)
+	- We return EINVAL for such version files that match the
+	above conditions.
+
+4) Retention policy:
+	- If a new backup has to be created and the existing number of backups
+	is more or equal to maxver for current mount, then we unlink the
+	oldest file till num backups is one less than maxver to accomodate
+	new backup file.
+	- We use xattrs (min_ver and max_ver) to get the total number of backups
+	for the file and then iteratively call unlink for oldest file till above
+	condition is met.
+	- If a backup file in unlinked following changes occur:
+		min_ver is decremented by 1 to indicate old file unlink
+
+	- We do not modify the file names, as it would be a cumbersome process
+	and incur additional overhead. And I believe we have a steady versions
+	handling mechanism so file renames can be avoided.
+
+5) Vesion management:
+	All the following functions have been supported using customized
+	ioctl calls in user code and an ioctl for each function is defined
+	in common header file.
+
+	Following functions have been supported by the bkfs module:
+	1) list versions
+	- This function list all the version files that exist
+	for the original file.
+	- If no version exist an empty list is returned, otherwise an errno
+	is returned
+
+	2) Delete version
+	- This function deletes the specified version for the file.
+	- If oldest is specified - delted the min_ver and increments
+	min_ver by 1.
+	- If newest is specified - delted the min_ver and decrements max_ver by 1.
+	- If all is specified - delted the max_ver iteratively and
+	decrements max_ver by 1 in each iteration.
+
+	3) View version
+	- This function stores the data from the required version file in the
+	user buffer in loop of size mentioned by user.
+	- We pass a pos variable initialized with 0 from user code when the
+	ioctl is called for the first time, then for each ioctl calls we update
+	pos by number of bytes read from the file and return 0 if EOF is reached
+	and set pos to 0 in that case.
+	- The pos variable helps retain the seek position between multiple and
+	successive ioctl calls.
+
+	4) Restore version
+	- This function restored the required version file in a new file
+	which can be accessed, modified and copied by the user easily.
+	- The restore file name is the same as the corresponding version
+	file name with the prefix eliminated (.FILE_v$num -> FILE_v$num).
+
+6) Mount options support:
+	- To include support for max versions during mounting of bkpfs
+	by the user, I have modified the bkpfs_mount function.
+	- To add max versions, we add a new attribute in superblock info
+	along with lower superblock, which stores the maxver supported
+	in the current mount.
+	- In bkpfs_mount the -o(option) string is validated and the number is
+	extracted from the string and set in superblock info.
+	- The verison provided must be between minver(=1) and maxver(=20)
+	mentioned in fs/bkpfs/bkpfs.h file.
+
+7) Dry run of bkpfs:
+	- Run "make" in hw2-nidnani folder
+	- Run "insmod /usr/src/hw2-nidnani/fs/bkpfs/"
+	- Run "mount -t bkpfs -o maxver=5 /usr/src/hw2-nidnani/test_dir/ /mnt/bkpfs/"
+	to mount bkpfs in /mnt/bkpfs/
+	- To test bkpctl, you can run any of the create_*.c files by passing
+	the mnt path for the file(new/existing) which then creates zero or more
+	versions of it and then run bkpctl with the appropriate flags to check
+	the functionalities provided.
+
+
+Notes for running test scripts(IMPORTANT to reproducing correct results):
+1) Run the Makefile in CSE-506 first to compile all the C helper code files
+
+2a) For running scripts [1-35], change the macro BKPFS_NUM_BYTES_THRESHOLD in
+fs/bkpfs/bkpfs.h (line 39) to 10, then run make in hw2-user and then run the
+scripts to produce correct results and verify the functionality.
+
+2b) For running scripts [36-38], revert the macro BKPFS_NUM_BYTES_THRESHOLD to
+1024, then make in hw2-user, and then run the script to produce appropriate
+results.
+
+3) For script [2] - do insmod, mount, touch file in mnt dir as root, then login
+to student and run scripts to get appropriate result.
+
+4) Also certain variables have been included in ~/.bashrc file to assist with
+the test scripts which include:
+	export BKPFS_TEST_FILE='test_bkpfs'
+	export BKPFS_MNT_VERSIONS=5
+	export BKPFS_MNT_DIR='/mnt/bkpfs'
+It is neccesary to have these veriables in bashrc file for the scripts to work
+
+5) In case of confusion with the script results, refer to the corresponding
+script, wherein I have mentioned the expected behavior in comments at the top.
+		"Hope it is not an issue :)"
+
+Testing(test_scripts/):
+Below are the checks done by the test scripts in test_scripts folder
+1) Test call with file which does not exist
+2) Test call with file without read perm
+3) Test call with number of version exceeding max version
+4) Test call with maxver=v2 and numver = v1 and then with maxver<v1 and then
+write to file
+5) Test list functionality with no versions
+6) Test list functionality with 1 version
+7) Test list functionality with normal numver
+8) Test delete for oldest version with normal numver
+9) Test delete for newest version with normal numver
+10) Test delete for all versions with normal numver
+11) Test delete for oldest version with 1 version
+12) Test delete for newest version with 1 version
+13) Test delete for all versions with 1 version
+14) Test delete for oldest version with no versions
+15) Test delete for newest version with no versions
+16) Test delete for all versions with no versions
+17) Test view for oldest version with normal numver
+18) Test view for newest version with normal numver
+19) Test view for V version with normal numver
+20) Test view for V version > maxver with normal numver
+21) Test view for oldest and newest version with 1 version
+22) Test view for oldest version with no versions
+23) Test view for newest version with no versions
+24) Test restore for newest version with normal numver
+25) Test restore for V version with normal numver
+26) Test retore for oldest version with normal number
+27) Test restore for V version > maxver with normal numver
+28) Test restore for newest and 1 version with 1 version
+29) Test restore for newest version with no versions
+30) Test delete newest then restore then delete newest then restore with
+normal numver
+31) Test mount with invalid string instead of maxver=
+32) Test mount with invalid number maxver=12c, etc.
+33) Test mount with version<minver
+34) Test mount with version>maxver
+35) Test call to check file hiding in mnt directory
+36) Test call with write of 4096 bytes
+(vfs makes call in slots of 4096 hence one bkp)
+37) Test call with large file write with open, write and close in loop
+(mult ver with diff of 4096)
+38) Test call with large file write with open, close and write in loop
+(mult ver with diff of 16)

@@ -1,0 +1,7 @@
+all: bkpctl
+
+bkpctl: bkpctl.c
+	gcc -Wall -Werror -I ../include/ bkpctl.c -o bkpctl
+
+clean:
+	rm -f bkpctl
